@@ -1,0 +1,253 @@
+import numpy as np
+import torch
+import librosa
+from hparams import hparams
+class Synthesizer:
+    sample_rate = hparams.sample_rate
+    hparams = hparams
+    
+    def _init_(self, model_fpath: Path, verbose=True):
+        """
+        The model isn't instantiated and loaded in memory until needed or until load() is called.
+        
+        :param model_fpath: path to the trained model file
+        :param verbose: if False, prints less information when using the model
+        """
+        self.model_fpath = model_fpath
+        self.verbose = verbose
+ 
+        # Check for GPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+        if self.verbose:
+            print("Synthesizer using device:", self.device)
+        
+        # Tacotron model will be instantiated later on first use.
+        self._model = None
+
+    def is_loaded(self):
+        """
+        Whether the model is loaded in memory.
+        """
+        return self._model is not None
+    
+    def load(self):
+        """
+        Instantiates and loads the model given the weights file that was passed in the constructor.
+        """
+        self._model = Tacotron(embed_dims=hparams.tts_embed_dims,
+                               num_chars=len(symbols),
+                               encoder_dims=hparams.tts_encoder_dims,
+                               decoder_dims=hparams.tts_decoder_dims,
+                               n_mels=hparams.num_mels,
+                               fft_bins=hparams.num_mels,
+                               postnet_dims=hparams.tts_postnet_dims,
+                               encoder_K=hparams.tts_encoder_K,
+                               lstm_dims=hparams.tts_lstm_dims,
+                               postnet_K=hparams.tts_postnet_K,
+                               num_highways=hparams.tts_num_highways,
+                               dropout=hparams.tts_dropout,
+                               stop_threshold=hparams.tts_stop_threshold,
+                               speaker_embedding_size=hparams.speaker_embedding_size).to(self.device)
+
+        self._model.load(self.model_fpath)
+        self._model.eval()
+
+        if self.verbose:
+            print("Loaded synthesizer \"%s\" trained to step %d" % (self.model_fpath.name, self._model.state_dict()["step"]))
+
+    def synthesize_spectrograms(self, texts: List[str],
+                                embeddings: Union[np.ndarray, List[np.ndarray]],
+                                return_alignments=False):
+        """
+        Synthesizes mel spectrograms from texts and speaker embeddings.
+
+        :param texts: a list of N text prompts to be synthesized
+        :param embeddings: a numpy array or list of speaker embeddings of shape (N, 256) 
+        :param return_alignments: if True, a matrix representing the alignments between the 
+        characters
+        and each decoder output step will be returned for each spectrogram
+        :return: a list of N melspectrograms as numpy arrays of shape (80, Mi), where Mi is the 
+        sequence length of spectrogram i, and possibly the alignments.
+        """
+        # Load the model on the first request.
+        if not self.is_loaded():
+            self.load()
+
+            # Print some info about the model when it is loaded            
+            tts_k = self._model.get_step() // 1000
+
+            simple_table([("Tacotron", str(tts_k) + "k"),("r", self._model.r)])
+
+        # Preprocess text inputs
+        inputs = [text_to_sequence(text.strip(), hparams.tts_cleaner_names) for text in texts]
+        if not isinstance(embeddings, list):
+            embeddings = [embeddings]
+
+        # Batch inputs
+        batched_inputs = [inputs[i:i+hparams.synthesis_batch_size]
+                             for i in range(0, len(inputs), hparams.synthesis_batch_size)]
+        batched_embeds = [embeddings[i:i+hparams.synthesis_batch_size]
+                             for i in range(0, len(embeddings), hparams.synthesis_batch_size)]
+
+        specs = []
+        for i, batch in enumerate(batched_inputs, 1):
+            if self.verbose:
+                print(f"\n| Generating {i}/{len(batched_inputs)}")
+
+            # Pad texts so they are all the same length
+            text_lens = [len(text) for text in batch]
+            max_text_len = max(text_lens)
+            chars = [pad1d(text, max_text_len) for text in batch]
+            chars = np.stack(chars)
+
+            # Stack speaker embeddings into 2D array for batch processing
+            speaker_embeds = np.stack(batched_embeds[i-1])
+
+            # Convert to tensor
+            chars = torch.tensor(chars).long().to(self.device)
+            speaker_embeddings = torch.tensor(speaker_embeds).float().to(self.device)
+
+            # Inference
+            _, mels, alignments = self._model.generate(chars, speaker_embeddings)
+            mels = mels.detach().cpu().numpy()
+
+            for m in mels:
+                # Trim silence from end of each spectrogram
+                while np.max(m[:, -1]) < hparams.tts_stop_threshold:
+                    m = m[:, :-1]
+                specs.append(m)
+
+        if self.verbose:
+            print("\n\nDone.\n")
+        return (specs, alignments) if return_alignments else specs
+
+    @staticmethod
+    def load_preprocess_wav(fpath):
+        """
+        Loads and preprocesses an audio file under the same conditions the audio files were used to
+        train the synthesizer. 
+        """
+        wav = librosa.load(str(fpath), hparams.sample_rate)[0]
+        if hparams.rescale:
+            wav = wav / np.abs(wav).max() * hparams.rescaling_max
+        return wav
+
+    @staticmethod
+    def make_spectrogram(fpath_or_wav: Union[str, Path, np.ndarray]):
+        """
+        Creates a mel spectrogram from an audio file in the same manner as the mel spectrograms that 
+        were fed to the synthesizer when training.
+        """
+        if isinstance(fpath_or_wav, str) or isinstance(fpath_or_wav, Path):
+            wav = Synthesizer.load_preprocess_wav(fpath_or_wav)
+        else:
+            wav = fpath_or_wav
+        
+        mel_spectrogram = audio.melspectrogram(wav, hparams).astype(np.float32)
+        return mel_spectrogram
+    
+    @staticmethod
+    def griffin_lim(mel):
+        """
+        Inverts a mel spectrogram using Griffin-Lim. The mel spectrogram is expected to have been built
+        with the same parameters present in hparams.py.
+        """
+        return audio.inv_mel_spectrogram(mel, hparams)
+
+embeds=np.array([4.97976206e-02, 4.23898594e-03, 3.01976595e-02, 0.00000000e+00,
+       1.45617956e-02, 5.77824861e-02, 0.00000000e+00, 4.12393361e-02,
+       1.25423400e-02, 1.85310878e-02, 9.30907652e-02, 1.30277038e-01,
+       2.76633482e-02, 2.14659832e-02, 2.20521484e-02, 0.00000000e+00,
+       4.37306277e-02, 4.85588312e-02, 5.76933147e-03, 1.13131069e-02,
+       4.89801057e-02, 2.40035400e-01, 4.81838454e-03, 0.00000000e+00,
+       0.00000000e+00, 3.36589455e-03, 8.31295699e-02, 5.93827514e-04,
+       8.54487624e-03, 0.00000000e+00, 1.16023332e-01, 1.47100210e-01,
+       4.00911048e-02, 1.58781931e-01, 7.53618358e-03, 4.37799878e-02,
+       3.50102521e-02, 1.96312945e-02, 0.00000000e+00, 3.60851809e-02,
+       2.55388470e-04, 1.06946841e-01, 1.90767404e-02, 6.23046346e-02,
+       6.35529160e-02, 9.87217724e-02, 1.46411796e-04, 3.52362320e-02,
+       6.70596510e-02, 1.73977129e-02, 0.00000000e+00, 1.03166029e-02,
+       1.03661083e-01, 0.00000000e+00, 0.00000000e+00, 5.34301437e-02,
+       9.54109523e-03, 1.07565043e-04, 1.01890527e-01, 1.94504508e-03,
+       9.35629904e-02, 7.03273639e-02, 6.92023244e-03, 0.00000000e+00,
+       9.25115123e-02, 0.00000000e+00, 8.12538713e-02, 3.08076888e-02,
+       0.00000000e+00, 8.20352603e-03, 4.32682373e-02, 4.37538326e-02,
+       0.00000000e+00, 7.01381192e-02, 4.61901189e-04, 7.03775361e-02,
+       0.00000000e+00, 5.43940701e-02, 2.26585567e-02, 9.17298794e-02,
+       5.68941534e-02, 2.00949669e-01, 8.78910050e-02, 4.82886136e-02,
+       4.77645335e-05, 1.17306551e-02, 2.17678156e-02, 7.44371116e-02,
+       1.04804349e-04, 1.13043189e-01, 1.13320023e-01, 0.00000000e+00,
+       2.78181303e-03, 0.00000000e+00, 5.89411845e-03, 0.00000000e+00,
+       9.15049948e-03, 0.00000000e+00, 2.61287147e-04, 6.37343433e-03,
+       1.22804781e-02, 0.00000000e+00, 4.64949682e-02, 8.11480358e-02,
+       6.50985390e-02, 2.81051248e-02, 6.79115951e-03, 1.18594393e-02,
+       2.19941773e-02, 1.29869685e-01, 0.00000000e+00, 3.39999124e-02,
+       6.16799633e-04, 1.73744380e-01, 1.47408433e-02, 0.00000000e+00,
+       1.10547282e-01, 3.52631952e-03, 3.82222910e-03, 0.00000000e+00,
+       2.79751420e-02, 4.32852618e-02, 1.18282191e-01, 1.66683257e-01,
+       1.10918703e-03, 6.79946691e-02, 2.49559388e-01, 1.01753198e-01,
+       3.03656310e-02, 3.79015022e-04, 6.63978932e-03, 0.00000000e+00,
+       1.28362153e-04, 1.26697868e-01, 1.20840669e-01, 2.66330913e-02,
+       5.46339713e-02, 0.00000000e+00, 1.47949932e-02, 6.21234393e-03,
+       9.43552353e-04, 0.00000000e+00, 6.43829554e-02, 1.44111589e-04,
+       6.38233796e-02, 8.42743539e-05, 3.79125103e-02, 1.34133105e-03,
+       1.01187482e-01, 9.54181924e-02, 5.81653155e-02, 4.24654521e-02,
+       0.00000000e+00, 4.16324583e-05, 1.54093152e-03, 5.56140877e-02,
+       2.70237308e-03, 7.57189095e-02, 4.95587382e-03, 5.23049571e-02,
+       7.58597394e-03, 1.60502456e-02, 1.03522554e-01, 2.54918449e-02,
+       2.47376338e-02, 4.63667559e-03, 7.11428281e-03, 1.45209998e-01,
+       1.38539925e-01, 1.51114628e-01, 7.65611112e-05, 1.85314112e-03,
+       3.37278470e-03, 4.70790714e-02, 7.55549548e-03, 3.46249603e-02,
+       5.55291492e-03, 2.59478278e-02, 2.00214004e-03, 1.39478063e-02,
+       6.85210824e-02, 8.11954588e-03, 2.05350444e-02, 4.86876182e-02,
+       2.74724769e-03, 0.00000000e+00, 1.05482794e-03, 6.00756072e-02,
+       0.00000000e+00, 4.48514055e-03, 3.22356969e-02, 1.56430826e-02,
+       3.28760507e-05, 3.54866572e-02, 0.00000000e+00, 2.23703887e-02,
+       1.14624656e-03, 6.87305778e-02, 9.64626297e-02, 3.10335606e-02,
+       1.89828034e-02, 5.79947866e-02, 3.25386040e-02, 1.32237691e-02,
+       0.00000000e+00, 1.51781216e-02, 5.63146546e-04, 1.28102573e-02,
+       4.92842123e-02, 8.07263539e-04, 4.28612828e-02, 1.05234422e-02,
+       8.27367008e-02, 1.70351490e-02, 3.55208613e-04, 4.37798537e-02,
+       0.00000000e+00, 1.30343474e-02, 3.84118520e-02, 2.53068865e-04,
+       1.42920613e-01, 9.32580966e-04, 1.22405896e-02, 0.00000000e+00,
+       2.17882618e-02, 1.03051178e-01, 1.44497305e-01, 6.78834319e-02,
+       0.00000000e+00, 3.20319971e-03, 4.51129042e-02, 0.00000000e+00,
+       2.19684397e-03, 0.00000000e+00, 0.00000000e+00, 1.17498578e-03,
+       8.98542907e-03, 1.44357651e-01, 6.29860982e-02, 6.23253435e-02,
+       7.41608664e-02, 1.18844271e-01, 4.30925228e-02, 1.48287848e-01,
+       1.99888676e-01, 1.52067855e-01, 4.31091934e-02, 4.45224643e-02,
+       9.26024094e-02, 1.22155203e-03, 7.43036624e-03, 7.98201710e-02,
+       5.66375926e-02, 0.00000000e+00, 2.15924997e-03, 2.71156104e-03], dtype = np.float32)
+
+def manual_seed(seed) -> torch._C.Generator:
+    r"""Sets the seed for generating random numbers. Returns a
+    `torch.Generator` object.
+
+    Args:
+        seed (int): The desired seed. Value must be within the inclusive range
+            `[-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff]`. Otherwise, a RuntimeError
+            is raised. Negative inputs are remapped to positive values with the formula
+            `0xffff_ffff_ffff_ffff + seed`.
+    """
+    seed = int(seed)
+    import torch.cuda
+
+    if not torch.cuda._is_in_bad_fork():
+        torch.cuda.manual_seed_all(seed)
+
+    return default_generator.manual_seed(seed)
+
+
+
+
+if _name_ == '_main_':
+    synthesizer = Synthesizer("synthesizer\pretrained.pt")
+    specs = synthesizer.synthesize_spectrograms(texts, embeds)
+    spec = specs[0]
+
+    print("Created the mel spectrogram")
+
+    if None is not None:
