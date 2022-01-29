@@ -2,11 +2,19 @@ import numpy as np
 import torch
 import librosa
 from hparams import hparams
+from audio import audio
+from pathlib import Path
+from torch._C import default_generator
+from synthesizer.models.tacotron import Tacotron
+from synthesizer.utils.symbols import symbols
+from typing import Union, List
+from . import cleaners
+import re
 class Synthesizer:
     sample_rate = hparams.sample_rate
     hparams = hparams
     
-    def _init_(self, model_fpath: Path, verbose=True):
+    def __init__(self, model_fpath: Path, verbose=True):
         """
         The model isn't instantiated and loaded in memory until needed or until load() is called.
         
@@ -157,6 +165,105 @@ class Synthesizer:
         """
         return audio.inv_mel_spectrogram(mel, hparams)
 
+def pad1d(x, max_len, pad_value=0):
+    return np.pad(x, (0, max_len - len(x)), mode="constant", constant_values=pad_value)
+
+def simple_table(item_tuples) :
+
+    border_pattern = '+---------------------------------------'
+    whitespace = '                                            '
+
+    headings, cells, = [], []
+
+    for item in item_tuples :
+
+        heading, cell = str(item[0]), str(item[1])
+
+        pad_head = True if len(heading) < len(cell) else False
+
+        pad = abs(len(heading) - len(cell))
+        pad = whitespace[:pad]
+
+        pad_left = pad[:len(pad)//2]
+        pad_right = pad[len(pad)//2:]
+
+        if pad_head :
+            heading = pad_left + heading + pad_right
+        else :
+            cell = pad_left + cell + pad_right
+
+        headings += [heading]
+        cells += [cell]
+
+    border, head, body = '', '', ''
+
+    for i in range(len(item_tuples)) :
+
+        temp_head = f'| {headings[i]} '
+        temp_body = f'| {cells[i]} '
+
+        border += border_pattern[:len(temp_head)]
+        head += temp_head
+        body += temp_body
+
+        if i == len(item_tuples) - 1 :
+            head += '|'
+            body += '|'
+            border += '+'
+
+    print(border)
+    print(head)
+    print(border)
+    print(body)
+    print(border)
+    print(' ')
+
+
+def text_to_sequence(text, cleaner_names):
+  """Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
+
+    The text can optionally have ARPAbet sequences enclosed in curly braces embedded
+    in it. For example, "Turn left on {HH AW1 S S T AH0 N} Street."
+
+    Args:
+      text: string to convert to a sequence
+      cleaner_names: names of the cleaner functions to run the text through
+
+    Returns:
+      List of integers corresponding to the symbols in the text
+  """
+  sequence = []
+
+  # Check for curly braces and treat their contents as ARPAbet:
+  while len(text):
+    m = _curly_re.match(text)
+    if not m:
+      sequence += _symbols_to_sequence(_clean_text(text, cleaner_names))
+      break
+    sequence += _symbols_to_sequence(_clean_text(m.group(1), cleaner_names))
+    sequence += _arpabet_to_sequence(m.group(2))
+    text = m.group(3)
+
+  # Append EOS token
+  sequence.append(_symbol_to_id["~"])
+  return sequence
+
+def _symbols_to_sequence(symbols):
+  return [_symbol_to_id[s] for s in symbols if _should_keep_symbol(s)]
+def _should_keep_symbol(s):
+  return s in _symbol_to_id and s not in ("_", "~")
+def _arpabet_to_sequence(text):
+  return _symbols_to_sequence(["@" + s for s in text.split()])
+def _clean_text(text, cleaner_names):
+  for name in cleaner_names:
+    cleaner = getattr(cleaners, name)
+    if not cleaner:
+      raise Exception("Unknown cleaner: %s" % name)
+    text = cleaner(text)
+  return text
+_curly_re = re.compile(r"(.*?)\{(.+?)\}(.*)")
+_symbol_to_id = {s: i for i, s in enumerate(symbols)}
+
 embeds=np.array([4.97976206e-02, 4.23898594e-03, 3.01976595e-02, 0.00000000e+00,
        1.45617956e-02, 5.77824861e-02, 0.00000000e+00, 4.12393361e-02,
        1.25423400e-02, 1.85310878e-02, 9.30907652e-02, 1.30277038e-01,
@@ -239,11 +346,14 @@ def manual_seed(seed) -> torch._C.Generator:
         torch.cuda.manual_seed_all(seed)
 
     return default_generator.manual_seed(seed)
+#=============================================================================================================
 
 
+if __name__ == '__main__':
 
+    text = input("Write a sentence (+-20 words) to be synthesized:\n")
+    texts = [text]
 
-if _name_ == '_main_':
     synthesizer = Synthesizer("synthesizer\pretrained.pt")
     specs = synthesizer.synthesize_spectrograms(texts, embeds)
     spec = specs[0]
@@ -251,3 +361,4 @@ if _name_ == '_main_':
     print("Created the mel spectrogram")
 
     if None is not None:
+        torch.manual_seed(args.seed)
