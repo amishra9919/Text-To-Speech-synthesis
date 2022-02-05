@@ -271,38 +271,6 @@ def _clean_text(text, cleaner_names):
 _curly_re = re.compile(r"(.*?)\{(.+?)\}(.*)")
 _symbol_to_id = {s: i for i, s in enumerate(symbols)}
 
-def load_model(weights_fpath, verbose=True):
-    global _model, _device
-    
-    if verbose:
-        print("Building Wave-RNN")
-    _model = WaveRNN(
-        rnn_dims=hp.voc_rnn_dims,
-        fc_dims=hp.voc_fc_dims,
-        bits=hp.bits,
-        pad=hp.voc_pad,
-        upsample_factors=hp.voc_upsample_factors,
-        feat_dims=hp.num_mels,
-        compute_dims=hp.voc_compute_dims,
-        res_out_dims=hp.voc_res_out_dims,
-        res_blocks=hp.voc_res_blocks,
-        hop_length=hp.hop_length,
-        sample_rate=hp.sample_rate,
-        mode=hp.voc_mode
-    )
-
-    if torch.cuda.is_available():
-        _model = _model.cuda()
-        _device = torch.device('cuda')
-    else:
-        _device = torch.device('cpu')
-    
-    if verbose:
-        print("Loading model weights at %s" % weights_fpath)
-    checkpoint = torch.load(weights_fpath, _device)
-    _model.load_state_dict(checkpoint['model_state'])
-    _model.eval()
-
 embeds = np.array([4.36053611e-03, 0.00000000e+00, 0.00000000e+00, 0.00000000e+00,   #milli audio
        2.03483347e-02, 1.25546426e-01, 0.00000000e+00, 4.16855551e-02,
        3.64836305e-02, 3.13142227e-04, 1.37346104e-01, 8.23495910e-02,
@@ -404,21 +372,12 @@ if __name__ == '__main__':
         text = input("Write a sentence (+-20 words) to be synthesized:\n")
         texts = [text]
 
-        if None is not None:
-            torch.manual_seed(seed)
-            synthesizer = Synthesizer(synthesizer_model)
-
         specs = synthesizer.synthesize_spectrograms(texts, embeds) #Synthesizes mel spectrograms from texts and speaker embeddings.
         spec = specs[0]
         print("Created the mel spectrogram")
 
         ## Generating the waveform
         print("Synthesizing the waveform:")
-
-        # If seed is specified, reset torch seed and reload vocoder
-        if seed is not None:
-            torch.manual_seed(seed)    
-            vocoder.load_model(vocoder_model)
             
         # Synthesizing the waveform is fairly straightforward. Remember that the longer the
         # spectrogram, the more time-efficient the vocoder.
